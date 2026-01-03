@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Annotated
 
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -9,6 +9,10 @@ from mcp.server.fastmcp import FastMCP
 
 import json
 from openai import OpenAI
+
+from mcp.types import CallToolResult, TextContent
+from pathlib import Path
+
 
 
 # MCP server (FastMCP) – high level API
@@ -79,16 +83,21 @@ class InsightsReport(BaseModel):
 # Helpers
 # ---------
 def _load_df() -> pd.DataFrame:
-    csv_path = os.getenv("CSV_PATH", os.path.join("data", "Online Sales Data.csv"))
+    # Resolve path relative to this file, not to current working directory
+    base_dir = Path(__file__).resolve().parent          # .../src
+    project_root = base_dir.parent                      # project root
+    default_csv = project_root / "data" / "Online Sales Data.csv"
+
+    csv_path = Path(os.getenv("CSV_PATH", str(default_csv)))
     df = pd.read_csv(csv_path)
 
-    # Normalize columns we know exist in your file
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["Units Sold"] = pd.to_numeric(df["Units Sold"], errors="coerce").fillna(0).astype(int)
     df["Unit Price"] = pd.to_numeric(df["Unit Price"], errors="coerce").fillna(0.0)
     df["Total Revenue"] = pd.to_numeric(df["Total Revenue"], errors="coerce").fillna(0.0)
 
     return df
+
 
 
 def _apply_filters(df: pd.DataFrame, f: FilterParams) -> pd.DataFrame:
@@ -209,7 +218,7 @@ def compute_sales_kpis(filters: FilterParams) -> KPISummary:
 def openai_generate_insights(
     kpis: KPISummary,
     question: str = "Give analytical insights and recommendations based on the KPIs only."
-) -> InsightsReport:
+) -> Annotated[CallToolResult, InsightsReport]:
     """
     Uses OpenAI to generate analytical insights from the KPI summary.
     """
@@ -244,7 +253,13 @@ def openai_generate_insights(
         text_format=InsightsReport,
         max_output_tokens=700,
     )
-    return response.output_parsed
+    report = response.output_parsed  # InsightsReport (Pydantic)
+    report_dict = report.model_dump() if hasattr(report, "model_dump") else report.dict()
+
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(report_dict, ensure_ascii=False))],
+        structuredContent=report_dict,
+    )
 
 
 
