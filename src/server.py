@@ -1,41 +1,47 @@
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Optional, Annotated
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Annotated, Optional
 
 import pandas as pd
+from openai import OpenAI
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP
-
-import json
-from openai import OpenAI
-
 from mcp.types import CallToolResult, TextContent
-from pathlib import Path
 
 
-
-# MCP server (FastMCP) – high level API
+# -----------------------------------------------------------------------------
+# MCP Server
+# -----------------------------------------------------------------------------
 mcp = FastMCP("CSV Sales Analyzer", json_response=True)
 
-# OpenAI client
-openai_client = OpenAI()
+REQUIRED_COLUMNS = [
+    "Date",
+    "Transaction ID",
+    "Region",
+    "Product Category",
+    "Product Name",
+    "Payment Method",
+    "Units Sold",
+    "Unit Price",
+    "Total Revenue",
+]
 
 
-# ---------
-# Models (Input / Output Schemas)
-# ---------
+# -----------------------------------------------------------------------------
+# Schemas (Input / Output)
+# -----------------------------------------------------------------------------
 class FilterParams(BaseModel):
-    start_date: Optional[str] = Field(
-        default=None, description="YYYY-MM-DD (inclusive). Example: 2024-01-01"
-    )
-    end_date: Optional[str] = Field(
-        default=None, description="YYYY-MM-DD (inclusive). Example: 2024-12-31"
-    )
+    start_date: Optional[str] = Field(default=None, description="YYYY-MM-DD (inclusive). Example: 2024-01-01")
+    end_date: Optional[str] = Field(default=None, description="YYYY-MM-DD (inclusive). Example: 2024-12-31")
     region: Optional[list[str]] = Field(default=None, description="Filter by Region values")
     product_category: Optional[list[str]] = Field(default=None, description="Filter by Product Category values")
     payment_method: Optional[list[str]] = Field(default=None, description="Filter by Payment Method values")
     product_name_contains: Optional[str] = Field(default=None, description="Substring match for Product Name")
+    # Used ONLY by filter_sales_data. compute_sales_kpis ignores it.
     limit: int = Field(default=200, ge=1, le=2000, description="Max preview rows returned")
 
 
@@ -79,18 +85,43 @@ class InsightsReport(BaseModel):
     recommendations: list[str]
 
 
-# ---------
+# -----------------------------------------------------------------------------
 # Helpers
-# ---------
-def _load_df() -> pd.DataFrame:
-    # Resolve path relative to this file, not to current working directory
-    base_dir = Path(__file__).resolve().parent          # .../src
-    project_root = base_dir.parent                      # project root
-    default_csv = project_root / "data" / "Online Sales Data.csv"
+# -----------------------------------------------------------------------------
+def _to_dict(model: Any) -> dict:
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
 
-    csv_path = Path(os.getenv("CSV_PATH", str(default_csv)))
+
+@lru_cache(maxsize=1)
+def _resolve_csv_path() -> Path:
+    """
+    Resolve CSV path relative to this file (stable), with CSV_PATH override.
+    """
+    base_dir = Path(__file__).resolve().parent         # .../src
+    project_root = base_dir.parent                     # project root
+    default_csv = project_root / "data" / "Online Sales Data.csv"
+    return Path(os.getenv("CSV_PATH", str(default_csv)))
+
+
+@lru_cache(maxsize=1)
+def _load_df() -> pd.DataFrame:
+    """
+    Load and normalize the dataset once (cached). Tools reuse it.
+    """
+    csv_path = _resolve_csv_path()
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"CSV not found at: {csv_path}. "
+            f"Put the file under ./data/Online Sales Data.csv or set CSV_PATH env var."
+        )
+
     df = pd.read_csv(csv_path)
 
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing required columns: {missing}")
+
+    # Normalize types
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["Units Sold"] = pd.to_numeric(df["Units Sold"], errors="coerce").fillna(0).astype(int)
     df["Unit Price"] = pd.to_numeric(df["Unit Price"], errors="coerce").fillna(0.0)
@@ -99,9 +130,20 @@ def _load_df() -> pd.DataFrame:
     return df
 
 
+@lru_cache(maxsize=1)
+def _openai_client() -> OpenAI:
+    """
+    Lazily initialize OpenAI client.
+    This prevents the server from failing to start when OPENAI_API_KEY is missing,
+    as long as you don't call the OpenAI tool.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not set. Set it before calling openai_generate_insights.")
+    return OpenAI()
+
 
 def _apply_filters(df: pd.DataFrame, f: FilterParams) -> pd.DataFrame:
-    out = df.copy()
+    out = df
 
     if f.start_date:
         start = pd.to_datetime(f.start_date)
@@ -147,9 +189,9 @@ def _group_metrics(df: pd.DataFrame, group_col: str, top_n: int = 10) -> list[Gr
     ]
 
 
-# ---------
+# -----------------------------------------------------------------------------
 # Tools
-# ---------
+# -----------------------------------------------------------------------------
 @mcp.tool()
 def filter_sales_data(filters: FilterParams) -> FilteredData:
     """Return filtered rows preview from the sales CSV."""
@@ -181,7 +223,7 @@ def compute_sales_kpis(filters: FilterParams) -> KPISummary:
     revenue_by_category = _group_metrics(filtered, "Product Category", top_n=10) if row_count else []
     revenue_by_region = _group_metrics(filtered, "Region", top_n=10) if row_count else []
 
-    top_products = []
+    top_products: list[ProductMetric] = []
     if row_count:
         g = (
             filtered.groupby("Product Name", dropna=False)
@@ -217,33 +259,28 @@ def compute_sales_kpis(filters: FilterParams) -> KPISummary:
 @mcp.tool()
 def openai_generate_insights(
     kpis: KPISummary,
-    question: str = "Give analytical insights and recommendations based on the KPIs only."
+    question: str = "Give analytical insights and recommendations based on the KPIs only.",
 ) -> Annotated[CallToolResult, InsightsReport]:
     """
-    Uses OpenAI to generate analytical insights from the KPI summary.
+    Use OpenAI to generate analytical insights from the KPI summary.
+    Returns both TextContent (JSON string) and structuredContent (dict).
     """
-
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
 
-    # Pydantic v1/v2 compatibility
-    kpis_dict = kpis.model_dump() if hasattr(kpis, "model_dump") else kpis.dict()
-
     system_instructions = (
-    "You are a business data analyst. Answer in an analytical (not creative) style. "
-    "Use only the data provided in the KPI. "
-    "If information is missing—specify that it cannot be inferred. "
-    "Each Insight should include numbers/percentages when possible. "
-    "Return structured output according to the given schema."
+        "You are a business data analyst. Answer in an analytical (not creative) style. "
+        "Use only the data provided in the KPI. "
+        "If information is missing—specify that it cannot be inferred. "
+        "Each Insight should include numbers/percentages when possible. "
+        "Return structured output according to the given schema."
     )
 
-    user_content = (
-        f"Question: {question}\n\n"
-        f"KPI (JSON):\n{json.dumps(kpis_dict, ensure_ascii=False)}"
-    )
+    kpis_dict = _to_dict(kpis)
+    user_content = f"Question: {question}\n\nKPI (JSON):\n{json.dumps(kpis_dict, ensure_ascii=False)}"
 
-    # Structured output (Pydantic schema)
-    response = openai_client.responses.parse(
+    client = _openai_client()
+    response = client.responses.parse(
         model=model,
         temperature=temperature,
         input=[
@@ -253,8 +290,9 @@ def openai_generate_insights(
         text_format=InsightsReport,
         max_output_tokens=700,
     )
-    report = response.output_parsed  # InsightsReport (Pydantic)
-    report_dict = report.model_dump() if hasattr(report, "model_dump") else report.dict()
+
+    report = response.output_parsed
+    report_dict = _to_dict(report)
 
     return CallToolResult(
         content=[TextContent(type="text", text=json.dumps(report_dict, ensure_ascii=False))],
@@ -262,7 +300,5 @@ def openai_generate_insights(
     )
 
 
-
 if __name__ == "__main__":
-    # Recommended transport for local testing with inspector
     mcp.run(transport="streamable-http")
